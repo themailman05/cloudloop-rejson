@@ -1,7 +1,7 @@
 FROM rust:latest as builder
 
 ENV LIBDIR /usr/lib/redis/modules
-ENV DEPS "python python-setuptools python-pip wget unzip build-essential clang-6.0 cmake"
+ENV DEPS "python python-setuptools python3-pip wget unzip build-essential clang-6.0 cmake"
 
 # Set up a build environment
 RUN set -ex;\
