@@ -35,7 +35,3 @@ COPY --from=search  /usr/lib/redis/modules/redisearch.so* "/usr/lib/redis/module
 RUN true
 
 RUN chown -R redis:redis /usr/lib/redis/modules
-
-CMD ["redis-server", \
-     "--loadmodule", "/usr/lib/redis/modules/rejson.so", \
-     "--loadmodule", "/usr/lib/redis/modules/redisearch.so"]
