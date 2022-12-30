@@ -1,12 +1,12 @@
 
 #----------------------------------------------------------------------------------------------
-FROM redisfab/redis:6.2.7-x64-bullseye AS redis
+FROM redis:7-bullseye AS redis
 FROM debian:bullseye-slim AS builder
 
 RUN if [ -f /root/.profile ]; then sed -ie 's/mesg n/tty -s \&\& mesg -n/g' /root/.profile; fi
 SHELL ["/bin/bash", "-l", "-c"]
 
-RUN echo "Building for bullseye (debian:bullseye-slim) for x64 [with Redis 6.2.6]"
+RUN echo "Building for bullseye (debian:bullseye-slim) for x64 [with Redis 7]"
 
 WORKDIR /build
 COPY --from=redis /usr/local/ /usr/local/
@@ -23,7 +23,7 @@ RUN make build SHOW=1
 
 #----------------------------------------------------------------------------------------------
 FROM redisfab/redisearch:master-x64-bullseye AS search
-FROM redisfab/redis:6.2.7-x64-bullseye
+FROM redis:7-bullseye
 
 WORKDIR /data
 
