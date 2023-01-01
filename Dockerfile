@@ -1,4 +1,3 @@
-
 #----------------------------------------------------------------------------------------------
 FROM redis:7-bullseye AS redis
 FROM debian:bullseye-slim AS builder
