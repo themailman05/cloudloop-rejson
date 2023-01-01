@@ -1,30 +1,56 @@
+/*
+ * Copyright Redis Ltd. 2016 - present
+ * Licensed under your choice of the Redis Source Available License 2.0 (RSALv2) or
+ * the Server Side Public License v1 (SSPLv1).
+ */
+
+extern crate pest;
 #[macro_use]
+extern crate pest_derive;
 extern crate redis_module;
 
+#[cfg(not(feature = "as-library"))]
+use commands::*;
 use redis_module::native_types::RedisType;
 use redis_module::raw::RedisModuleTypeMethods;
-use redis_module::{raw as rawmod, NextArg};
-use redis_module::{Context, RedisError, RedisResult, RedisValue, REDIS_OK};
-use serde_json::{Number, Value};
+#[cfg(not(feature = "as-library"))]
+use redis_module::InfoContext;
 
-use std::{i64, usize};
+#[cfg(not(feature = "as-library"))]
+use redis_module::Status;
+#[cfg(not(feature = "as-library"))]
+use redis_module::{Context, RedisResult};
+
+#[cfg(not(feature = "as-library"))]
+use crate::c_api::{
+    get_llapi_ctx, json_api_free_iter, json_api_get, json_api_get_at, json_api_get_boolean,
+    json_api_get_double, json_api_get_int, json_api_get_json, json_api_get_json_from_iter,
+    json_api_get_len, json_api_get_string, json_api_get_type, json_api_is_json, json_api_len,
+    json_api_next, json_api_open_key_internal, json_api_reset_iter, LLAPI_CTX,
+};
+use crate::redisjson::Format;
 
 mod array_index;
 mod backward;
-mod commands;
-mod error;
-mod nodevisitor;
-mod redisjson;
-mod schema; // TODO: Remove
+pub mod c_api;
+pub mod commands;
+pub mod error;
+mod formatter;
+pub mod ivalue_manager;
+pub mod jsonpath;
+pub mod manager;
+pub mod redisjson;
 
-use crate::array_index::ArrayIndex;
-use crate::commands::index;
-use crate::error::Error;
-use crate::redisjson::{Format, Path, RedisJSON, SetOptions};
+pub const GIT_SHA: Option<&str> = std::option_env!("GIT_SHA");
+pub const GIT_BRANCH: Option<&str> = std::option_env!("GIT_BRANCH");
+pub const MODULE_NAME: &str = "ReJSON";
+pub const MODULE_TYPE_NAME: &str = "ReJSON-RL";
 
-static REDIS_JSON_TYPE: RedisType = RedisType::new(
-    "ReJSON-RL",
-    2,
+pub const REDIS_JSON_TYPE_VERSION: i32 = 3;
+
+pub static REDIS_JSON_TYPE: RedisType = RedisType::new(
+    MODULE_TYPE_NAME,
+    REDIS_JSON_TYPE_VERSION,
     RedisModuleTypeMethods {
         version: redis_module::TYPE_METHOD_VERSION,
 
@@ -34,787 +60,199 @@ static REDIS_JSON_TYPE: RedisType = RedisType::new(
         free: Some(redisjson::type_methods::free),
 
         // Currently unused by Redis
-        mem_usage: None,
+        mem_usage: Some(redisjson::type_methods::mem_usage),
         digest: None,
 
         // Auxiliary data (v2)
         aux_load: None,
         aux_save: None,
         aux_save_triggers: 0,
+
+        free_effort: None,
+        unlink: None,
+        copy: Some(redisjson::type_methods::copy),
+        defrag: None,
     },
 );
+/////////////////////////////////////////////////////
 
-///
-/// Backwards compatibility convertor for RedisJSON 1.x clients
-///
-fn backwards_compat_path(mut path: String) -> String {
-    if !path.starts_with("$") {
-        if path == "." {
-            path.replace_range(..1, "$");
-        } else if path.starts_with(".") {
-            path.insert(0, '$');
-        } else {
-            path.insert_str(0, "$.");
-        }
-    }
-    return path;
+#[derive(Copy, Clone)]
+pub enum ManagerType {
+    SerdeValue,
+    IValue,
 }
 
-///
-/// JSON.DEL <key> [path]
-///
-fn json_del(ctx: &Context, args: Vec<String>) -> RedisResult {
-    let mut args = args.into_iter().skip(1);
+pub static mut MANAGER: ManagerType = ManagerType::IValue;
 
-    let key = args.next_string()?;
-    let path = backwards_compat_path(args.next_string()?);
-
-    let key = ctx.open_key_writable(&key);
-    let deleted = match key.get_value::<RedisJSON>(&REDIS_JSON_TYPE)? {
-        Some(doc) => {
-            let res = if path == "$" {
-                key.delete()?;
-                1
-            } else {
-                doc.delete_path(&path)?
-            };
-            ctx.replicate_verbatim();
-            res
-        }
-        None => 0,
-    };
-    Ok(deleted.into())
+#[must_use]
+pub fn get_manager_type() -> ManagerType {
+    unsafe { MANAGER }
 }
 
-///
-/// JSON.SET <key> <path> <json> [NX | XX | FORMAT <format> | INDEX <index>]
-///
-fn json_set(ctx: &Context, args: Vec<String>) -> RedisResult {
-    let mut args = args.into_iter().skip(1);
-
-    let key = args.next_string()?;
-    let path = backwards_compat_path(args.next_string()?);
-    let value = args.next_string()?;
-
-    let mut format = Format::JSON;
-    let mut set_option = SetOptions::None;
-    let mut index = None;
-
-    loop {
-        if let Some(s) = args.next() {
-            match s.to_uppercase().as_str() {
-                "NX" => set_option = SetOptions::NotExists,
-                "XX" => set_option = SetOptions::AlreadyExists,
-                "FORMAT" => {
-                    format = Format::from_str(args.next_string()?.as_str())?;
+#[macro_export]
+macro_rules! run_on_manager {
+    (
+    pre_command: $pre_command_expr:expr,
+    get_mngr: $get_mngr_expr:expr,
+    run: $run_expr:expr,
+    ) => {{
+        $pre_command_expr();
+        let m = $get_mngr_expr;
+        match m {
+            Some(mngr) => $run_expr(mngr),
+            None => match $crate::get_manager_type() {
+                $crate::ManagerType::IValue => {
+                    $run_expr($crate::ivalue_manager::RedisIValueJsonKeyManager {
+                        phantom: PhantomData,
+                    })
                 }
-                "INDEX" => {
-                    index = Some(args.next_string()?);
+                $crate::ManagerType::SerdeValue => {
+                    $run_expr($crate::manager::RedisJsonKeyManager {
+                        phantom: PhantomData,
+                    })
                 }
-                _ => break,
-            };
-        } else {
-            break;
+            },
         }
-    }
-
-    let redis_key = ctx.open_key_writable(&key);
-    let current = redis_key.get_value::<RedisJSON>(&REDIS_JSON_TYPE)?;
-
-    match (current, set_option) {
-        (Some(ref mut doc), ref op) => {
-            if doc.set_value(&value, &path, op, format)? {
-                if let Some(index) = index {
-                    index::add_document(&key, &index, &doc)?;
-                }
-                ctx.replicate_verbatim();
-                REDIS_OK
-            } else {
-                Ok(RedisValue::None)
-            }
-        }
-        (None, SetOptions::AlreadyExists) => Ok(RedisValue::None),
-        (None, _) => {
-            let doc = RedisJSON::from_str(&value, &index, format)?;
-            if path == "$" {
-                redis_key.set_value(&REDIS_JSON_TYPE, doc)?;
-
-                if let Some(index) = index {
-                    // FIXME: We need to get the value even though we just set it,
-                    // since the original doc is consumed by set_value.
-                    // Can we do better than this?
-                    let doc = redis_key.get_value(&REDIS_JSON_TYPE)?.unwrap();
-                    index::add_document(&key, &index, doc)?;
-                }
-                ctx.replicate_verbatim();
-                REDIS_OK
-            } else {
-                Err("ERR new objects must be created at the root".into())
-            }
-        }
-    }
+    }};
 }
 
-///
-/// JSON.GET <key>
-///         [INDENT indentation-string]
-///         [NEWLINE line-break-string]
-///         [SPACE space-string]
-///         [NOESCAPE]
-///         [path ...]
-///
-/// TODO add support for multi path
-fn json_get(ctx: &Context, args: Vec<String>) -> RedisResult {
-    let mut args = args.into_iter().skip(1);
-    let key = args.next_string()?;
+#[macro_export]
+macro_rules! redis_json_module_create {(
+        data_types: [
+            $($data_type:ident),* $(,)*
+        ],
+        pre_command_function: $pre_command_function_expr:expr,
+        get_manage: $get_manager_expr:expr,
+        version: $version:expr,
+        init: $init_func:expr,
+        info: $info_func:ident,
+    ) => {
 
-    let mut paths: Vec<Path> = vec![];
-    let mut first_loop = true;
-    let mut format = Format::JSON;
-    loop {
-        let arg = match args.next_string() {
-            Ok(s) => s,
-            Err(_) => {
-                // path is optional -> no path found on the first loop we use root "$"
-                if first_loop {
-                    paths.push(Path::new("$".to_string()));
-                }
-                break;
-            }
+        use redis_module::{redis_command, redis_module, RedisString};
+        use std::marker::PhantomData;
+        use std::os::raw::{c_double, c_int, c_longlong};
+        use redis_module::{raw as rawmod, LogLevel};
+        use rawmod::ModuleOptions;
+
+        use std::{
+            ffi::CStr,
+            os::raw::{c_char, c_void},
         };
-        first_loop = false;
+        use libc::size_t;
+        use std::collections::HashMap;
+        use $crate::c_api::create_rmstring;
 
-        match arg.to_uppercase().as_str() {
-            "INDENT" => {
-                args.next();
-            } // TODO add support
-            "NEWLINE" => {
-                args.next();
-            } // TODO add support
-            "SPACE" => {
-                args.next();
-            } // TODO add support
-            "NOESCAPE" => {
-                continue;
-            } // TODO add support
-            "FORMAT" => {
-                format = Format::from_str(args.next_string()?.as_str())?;
-            }
-            _ => {
-                paths.push(Path::new(arg));
-            }
-        };
-    }
-
-    let key = ctx.open_key_writable(&key);
-    let value = match key.get_value::<RedisJSON>(&REDIS_JSON_TYPE)? {
-        Some(doc) => if paths.len() == 1 {
-            doc.to_string(&paths[0].fixed, format)?
-        } else {
-            // can't be smaller than 1
-            doc.to_json(&mut paths)?
-        }
-        .into(),
-        None => RedisValue::None,
-    };
-
-    Ok(value)
-}
-
-///
-/// JSON.MGET <key> [key ...] <path>
-///
-fn json_mget(ctx: &Context, args: Vec<String>) -> RedisResult {
-    if args.len() < 3 {
-        return Err(RedisError::WrongArity);
-    }
-
-    args.last().ok_or(RedisError::WrongArity).and_then(|path| {
-        let path = backwards_compat_path(path.to_string());
-        let keys = &args[1..args.len() - 1];
-
-        let results: Result<Vec<RedisValue>, RedisError> = keys
-            .iter()
-            .map(|key| {
-                let result = ctx
-                    .open_key(key)
-                    .get_value::<RedisJSON>(&REDIS_JSON_TYPE)?
-                    .map(|doc| doc.to_string(&path, Format::JSON))
-                    .transpose()?;
-
-                Ok(result.into())
-            })
-            .collect();
-
-        Ok(results?.into())
-    })
-}
-
-///
-/// JSON.STRLEN <key> [path]
-///
-fn json_str_len(ctx: &Context, args: Vec<String>) -> RedisResult {
-    json_len(ctx, args, |doc, path| doc.str_len(path))
-}
-
-///
-/// JSON.TYPE <key> [path]
-///
-fn json_type(ctx: &Context, args: Vec<String>) -> RedisResult {
-    let mut args = args.into_iter().skip(1);
-    let key = args.next_string()?;
-    let path = backwards_compat_path(args.next_string()?);
-
-    let key = ctx.open_key(&key);
-
-    let value = key.get_value::<RedisJSON>(&REDIS_JSON_TYPE)?.map_or_else(
-        || RedisValue::None,
-        |doc| match doc.get_type(&path) {
-            Ok(s) => s.into(),
-            Err(_) => RedisValue::None,
-        },
-    );
-
-    Ok(value)
-}
-
-///
-/// JSON.NUMINCRBY <key> <path> <number>
-///
-fn json_num_incrby(ctx: &Context, args: Vec<String>) -> RedisResult {
-    json_num_op(ctx, args, |i1, i2| i1 + i2, |f1, f2| f1 + f2)
-}
-
-///
-/// JSON.NUMMULTBY <key> <path> <number>
-///
-fn json_num_multby(ctx: &Context, args: Vec<String>) -> RedisResult {
-    json_num_op(ctx, args, |i1, i2| i1 * i2, |f1, f2| f1 * f2)
-}
-
-///
-/// JSON.NUMPOWBY <key> <path> <number>
-///
-fn json_num_powby(ctx: &Context, args: Vec<String>) -> RedisResult {
-    json_num_op(ctx, args, |i1, i2| i1.pow(i2 as u32), |f1, f2| f1.powf(f2))
-}
-
-fn json_num_op<I, F>(ctx: &Context, args: Vec<String>, op_i64: I, op_f64: F) -> RedisResult
-where
-    I: Fn(i64, i64) -> i64,
-    F: Fn(f64, f64) -> f64,
-{
-    let mut args = args.into_iter().skip(1);
-
-    let key = args.next_string()?;
-    let path = backwards_compat_path(args.next_string()?);
-    let number = args.next_string()?;
-
-    let key = ctx.open_key_writable(&key);
-
-    key.get_value::<RedisJSON>(&REDIS_JSON_TYPE)?
-        .ok_or_else(RedisError::nonexistent_key)
-        .and_then(|doc| {
-            doc.value_op(&path, |value| {
-                do_json_num_op(&number, value, &op_i64, &op_f64)
-            })
-            .map(|v| {
-                ctx.replicate_verbatim();
-                v.to_string().into()
-            })
-            .map_err(|e| e.into())
-        })
-}
-
-fn do_json_num_op<I, F>(
-    in_value: &str,
-    curr_value: &Value,
-    op_i64: I,
-    op_f64: F,
-) -> Result<Value, Error>
-where
-    I: FnOnce(i64, i64) -> i64,
-    F: FnOnce(f64, f64) -> f64,
-{
-    if let Value::Number(curr_value) = curr_value {
-        let in_value = &serde_json::from_str(in_value)?;
-        if let Value::Number(in_value) = in_value {
-            let num_res = match (curr_value.as_i64(), in_value.as_i64()) {
-                (Some(num1), Some(num2)) => op_i64(num1, num2).into(),
-                _ => {
-                    let num1 = curr_value.as_f64().unwrap();
-                    let num2 = in_value.as_f64().unwrap();
-                    Number::from_f64(op_f64(num1, num2)).unwrap()
+        macro_rules! json_command {
+            ($cmd:ident) => {
+                |ctx: &Context, args: Vec<RedisString>| -> RedisResult {
+                    run_on_manager!(
+                        pre_command: ||$pre_command_function_expr(ctx, &args),
+                        get_mngr: $get_manager_expr,
+                        run: |mngr|$cmd(mngr, ctx, args),
+                    )
                 }
             };
-
-            Ok(Value::Number(num_res))
-        } else {
-            Err(err_json(in_value, "number"))
-        }
-    } else {
-        Err(err_json(curr_value, "number"))
-    }
-}
-
-fn err_json(value: &Value, expected_value: &'static str) -> Error {
-    Error::from(format!(
-        "ERR wrong type of path value - expected {} but found {}",
-        expected_value,
-        RedisJSON::value_name(value)
-    ))
-}
-
-///
-/// JSON.STRAPPEND <key> [path] <json-string>
-///
-fn json_str_append(ctx: &Context, args: Vec<String>) -> RedisResult {
-    let mut args = args.into_iter().skip(1);
-
-    let key = args.next_string()?;
-    let path_or_json = args.next_string()?;
-
-    let path;
-    let json;
-
-    // path is optional
-    if let Ok(val) = args.next_string() {
-        path = backwards_compat_path(path_or_json);
-        json = val;
-    } else {
-        path = "$".to_string();
-        json = path_or_json;
-    }
-
-    let key = ctx.open_key_writable(&key);
-
-    key.get_value::<RedisJSON>(&REDIS_JSON_TYPE)?
-        .ok_or_else(RedisError::nonexistent_key)
-        .and_then(|doc| {
-            doc.value_op(&path, |value| do_json_str_append(&json, value))
-                .map(|v| {
-                    ctx.replicate_verbatim();
-                    v.as_str().map_or(usize::MAX, |v| v.len()).into()
-                })
-                .map_err(|e| e.into())
-        })
-}
-
-fn do_json_str_append(json: &String, value: &Value) -> Result<Value, Error> {
-    value
-        .as_str()
-        .ok_or_else(|| err_json(value, "string"))
-        .and_then(|curr| {
-            let v = serde_json::from_str(json)?;
-            if let Value::String(s) = v {
-                let new_value = [curr, s.as_str()].concat();
-                Ok(Value::String(new_value))
-            } else {
-                Err(format!("ERR wrong type of value - expected string but found {}", v).into())
-            }
-        })
-}
-
-///
-/// JSON.ARRAPPEND <key> <path> <json> [json ...]
-///
-fn json_arr_append(ctx: &Context, args: Vec<String>) -> RedisResult {
-    let mut args = args.into_iter().skip(1).peekable();
-
-    let key = args.next_string()?;
-    let path = backwards_compat_path(args.next_string()?);
-
-    // We require at least one JSON item to append
-    args.peek().ok_or(RedisError::WrongArity)?;
-
-    let key = ctx.open_key_writable(&key);
-
-    key.get_value::<RedisJSON>(&REDIS_JSON_TYPE)?
-        .ok_or_else(RedisError::nonexistent_key)
-        .and_then(|doc| {
-            doc.value_op(&path, |value| do_json_arr_append(args.clone(), value))
-                .map(|v| {
-                    ctx.replicate_verbatim();
-                    v.as_array().map_or(usize::MAX, |v| v.len()).into()
-                })
-                .map_err(|e| e.into())
-        })
-}
-
-fn do_json_arr_append<I>(args: I, value: &Value) -> Result<Value, Error>
-where
-    I: Iterator<Item = String>,
-{
-    value
-        .as_array()
-        .ok_or_else(|| err_json(value, "array"))
-        .and_then(|curr| {
-            let items: Vec<Value> = args
-                .map(|json| serde_json::from_str(&json))
-                .collect::<Result<_, _>>()?;
-
-            let new_value = [curr.as_slice(), &items].concat();
-            Ok(Value::Array(new_value))
-        })
-}
-
-///
-/// JSON.ARRINDEX <key> <path> <json-scalar> [start [stop]]
-///
-/// scalar - number, string, Boolean (true or false), or null
-///
-fn json_arr_index(ctx: &Context, args: Vec<String>) -> RedisResult {
-    let mut args = args.into_iter().skip(1);
-
-    let key = args.next_string()?;
-    let path = backwards_compat_path(args.next_string()?);
-    let json_scalar = args.next_string()?;
-    let start: i64 = args.next().map(|v| v.parse()).unwrap_or(Ok(0))?;
-    let end: i64 = args.next().map(|v| v.parse()).unwrap_or(Ok(i64::MAX))?;
-
-    args.done()?; // TODO: Add to other functions as well to terminate args list
-
-    let key = ctx.open_key(&key);
-
-    let index = key
-        .get_value::<RedisJSON>(&REDIS_JSON_TYPE)?
-        .map_or(Ok(-1), |doc| doc.arr_index(&path, &json_scalar, start, end))?;
-
-    Ok(index.into())
-}
-
-///
-/// JSON.ARRINSERT <key> <path> <index> <json> [json ...]
-///
-fn json_arr_insert(ctx: &Context, args: Vec<String>) -> RedisResult {
-    let mut args = args.into_iter().skip(1).peekable();
-
-    let key = args.next_string()?;
-    let path = backwards_compat_path(args.next_string()?);
-    let index = args.next_i64()?;
-
-    // We require at least one JSON item to append
-    args.peek().ok_or(RedisError::WrongArity)?;
-
-    let key = ctx.open_key_writable(&key);
-
-    key.get_value::<RedisJSON>(&REDIS_JSON_TYPE)?
-        .ok_or_else(RedisError::nonexistent_key)
-        .and_then(|doc| {
-            doc.value_op(&path, |value| {
-                do_json_arr_insert(args.clone(), index, value)
-            })
-            .map(|v| {
-                ctx.replicate_verbatim();
-                v.as_array().map_or(usize::MAX, |v| v.len()).into()
-            })
-            .map_err(|e| e.into())
-        })
-}
-
-fn do_json_arr_insert<I>(args: I, index: i64, value: &Value) -> Result<Value, Error>
-where
-    I: Iterator<Item = String>,
-{
-    value
-        .as_array()
-        .ok_or_else(|| err_json(value, "array"))
-        .and_then(|curr| {
-            let len = curr.len() as i64;
-
-            if !(-len..len).contains(&index) {
-                return Err("ERR index out of bounds".into());
-            }
-
-            let index = index.normalize(len);
-
-            let items: Vec<Value> = args
-                .map(|json| serde_json::from_str(&json))
-                .collect::<Result<_, _>>()?;
-
-            let mut new_value = curr.to_owned();
-            new_value.splice(index..index, items.into_iter());
-
-            Ok(Value::Array(new_value))
-        })
-}
-
-///
-/// JSON.ARRLEN <key> [path]
-///
-fn json_arr_len(ctx: &Context, args: Vec<String>) -> RedisResult {
-    json_len(ctx, args, |doc, path| doc.arr_len(path))
-}
-
-///
-/// JSON.ARRPOP <key> [path [index]]
-///
-fn json_arr_pop(ctx: &Context, args: Vec<String>) -> RedisResult {
-    let mut args = args.into_iter().skip(1);
-
-    let key = args.next_string()?;
-
-    let (path, index) = args
-        .next()
-        .map(|p| {
-            let path = backwards_compat_path(p);
-            let index = args.next_i64().unwrap_or(i64::MAX);
-            (path, index)
-        })
-        .unwrap_or(("$".to_string(), i64::MAX));
-
-    let key = ctx.open_key_writable(&key);
-    let mut res = Value::Null;
-
-    key.get_value::<RedisJSON>(&REDIS_JSON_TYPE)?
-        .ok_or_else(RedisError::nonexistent_key)
-        .and_then(|doc| {
-            doc.value_op(&path, |value| do_json_arr_pop(index, &mut res, value))
-                .map(|v| {
-                    ctx.replicate_verbatim();
-                    v
-                })
-                .map_err(|e| e.into())
-        })?;
-    Ok(RedisJSON::serialize(&res, Format::JSON)?.into())
-}
-
-fn do_json_arr_pop(mut index: i64, res: &mut Value, value: &Value) -> Result<Value, Error> {
-    value
-        .as_array()
-        .ok_or_else(|| err_json(value, "array"))
-        .and_then(|curr| {
-            let len = curr.len() as i64;
-
-            index = index.min(len - 1);
-
-            if index < 0 {
-                index = len + index;
-            }
-
-            if index >= len || index < 0 {
-                return Err("ERR index out of bounds".into());
-            }
-
-            let mut new_value = curr.to_owned();
-            *res = new_value.remove(index as usize);
-            Ok(Value::Array(new_value))
-        })
-}
-
-///
-/// JSON.ARRTRIM <key> <path> <start> <stop>
-///
-fn json_arr_trim(ctx: &Context, args: Vec<String>) -> RedisResult {
-    let mut args = args.into_iter().skip(1);
-
-    let key = args.next_string()?;
-    let path = backwards_compat_path(args.next_string()?);
-    let start = args.next_i64()?;
-    let stop = args.next_i64()?;
-
-    let key = ctx.open_key_writable(&key);
-
-    key.get_value::<RedisJSON>(&REDIS_JSON_TYPE)?
-        .ok_or_else(RedisError::nonexistent_key)
-        .and_then(|doc| {
-            doc.value_op(&path, |value| do_json_arr_trim(start, stop, &value))
-                .map(|v| {
-                    ctx.replicate_verbatim();
-                    v.as_array().map_or(usize::MAX, |v| v.len()).into()
-                })
-                .map_err(|e| e.into())
-        })
-}
-
-fn do_json_arr_trim(start: i64, stop: i64, value: &Value) -> Result<Value, Error> {
-    value
-        .as_array()
-        .ok_or_else(|| err_json(value, "array"))
-        .and_then(|curr| {
-            let len = curr.len() as i64;
-            let stop = stop.normalize(len);
-
-            let range = if start > len || start > stop as i64 {
-                0..0 // Return an empty array
-            } else {
-                start.normalize(len)..(stop + 1)
-            };
-
-            let res = &curr[range];
-            Ok(Value::Array(res.to_vec()))
-        })
-}
-
-///
-/// JSON.OBJKEYS <key> [path]
-///
-fn json_obj_keys(ctx: &Context, args: Vec<String>) -> RedisResult {
-    let mut args = args.into_iter().skip(1);
-    let key = args.next_string()?;
-    let path = backwards_compat_path(args.next_string()?);
-
-    let key = ctx.open_key(&key);
-
-    let value = match key.get_value::<RedisJSON>(&REDIS_JSON_TYPE)? {
-        Some(doc) => doc.obj_keys(&path)?.into(),
-        None => RedisValue::None,
-    };
-
-    Ok(value)
-}
-
-///
-/// JSON.OBJLEN <key> [path]
-///
-fn json_obj_len(ctx: &Context, args: Vec<String>) -> RedisResult {
-    json_len(ctx, args, |doc, path| doc.obj_len(path))
-}
-
-///
-/// JSON.DEBUG <subcommand & arguments>
-///
-/// subcommands:
-/// MEMORY <key> [path]
-/// HELP
-///
-fn json_debug(ctx: &Context, args: Vec<String>) -> RedisResult {
-    let mut args = args.into_iter().skip(1);
-    match args.next_string()?.to_uppercase().as_str() {
-        "MEMORY" => {
-            let key = args.next_string()?;
-            let path = backwards_compat_path(args.next_string()?);
-
-            let key = ctx.open_key(&key);
-            let value = match key.get_value::<RedisJSON>(&REDIS_JSON_TYPE)? {
-                Some(doc) => doc.get_memory(&path)?,
-                None => 0,
-            };
-            Ok(value.into())
-        }
-        "HELP" => {
-            let results = vec![
-                "MEMORY <key> [path] - reports memory usage",
-                "HELP                - this message",
-            ];
-            Ok(results.into())
-        }
-        _ => Err("ERR unknown subcommand - try `JSON.DEBUG HELP`".into()),
-    }
-}
-
-///
-/// JSON.RESP <key> [path]
-///
-fn json_resp(ctx: &Context, args: Vec<String>) -> RedisResult {
-    let mut args = args.into_iter().skip(1);
-
-    let key = args.next_string()?;
-    let path = backwards_compat_path(args.next_string()?);
-
-    let key = ctx.open_key(&key);
-    match key.get_value::<RedisJSON>(&REDIS_JSON_TYPE)? {
-        Some(doc) => Ok(resp_serialize(doc.get_first(&path)?)),
-        None => Ok(RedisValue::None),
-    }
-}
-
-fn resp_serialize(doc: &Value) -> RedisValue {
-    match doc {
-        Value::Null => RedisValue::None,
-
-        Value::Bool(b) => RedisValue::SimpleString(b.to_string()),
-
-        Value::Number(n) => n
-            .as_i64()
-            .map(|i| RedisValue::Integer(i))
-            .unwrap_or_else(|| RedisValue::Float(n.as_f64().unwrap())),
-
-        Value::String(s) => RedisValue::BulkString(s.clone()),
-
-        Value::Array(arr) => {
-            let mut res: Vec<RedisValue> = Vec::with_capacity(arr.len() + 1);
-            res.push(RedisValue::SimpleStringStatic("["));
-            arr.iter().for_each(|v| res.push(resp_serialize(v)));
-            RedisValue::Array(res)
         }
 
-        Value::Object(obj) => {
-            let mut res: Vec<RedisValue> = Vec::with_capacity(obj.len() + 1);
-            res.push(RedisValue::SimpleStringStatic("{"));
-            for (key, value) in obj.iter() {
-                res.push(RedisValue::BulkString(key.to_string()));
-                res.push(resp_serialize(value));
+        redis_json_module_export_shared_api! {
+            get_manage:$get_manager_expr,
+            pre_command_function: $pre_command_function_expr,
+        }
+
+        fn initialize(ctx: &Context, args: &[RedisString]) -> Status {
+            ctx.log_notice(&format!("version: {} git sha: {} branch: {}",
+                $version,
+                match GIT_SHA { Some(val) => val, _ => "unknown"},
+                match GIT_BRANCH { Some(val) => val, _ => "unknown"},
+                ));
+            export_shared_api(ctx);
+            ctx.set_module_options(ModuleOptions::HANDLE_IO_ERRORS);
+            ctx.log_notice("Enabled diskless replication");
+            $init_func(ctx, args)
+        }
+
+        fn json_init_config(ctx: &Context, args: &[RedisString]) -> Status{
+            if args.len() % 2 != 0 {
+                ctx.log(LogLevel::Warning, "RedisJson arguments must be key:value pairs");
+                return Status::Err;
             }
-            RedisValue::Array(res)
+            let mut args_map = HashMap::<String, String>::new();
+            for i in (0..args.len()).step_by(2) {
+                args_map.insert(args[i].to_string_lossy(), args[i + 1].to_string_lossy());
+            }
+
+            if let Some(backend) = args_map.get("JSON_BACKEND") {
+                if  backend == "SERDE_JSON" {
+                    unsafe {$crate::MANAGER = $crate::ManagerType::SerdeValue};
+                } else if backend == "IJSON" {
+                    unsafe {$crate::MANAGER = $crate::ManagerType::IValue};
+                } else {
+                    ctx.log(LogLevel::Warning, "Unsupported json backend was given");
+                    return Status::Err;
+                }
+            }
+
+            Status::Ok
+        }
+
+        redis_module! {
+            name: $crate::MODULE_NAME,
+            version: $version,
+            data_types: [$($data_type,)*],
+            init: json_init_config,
+            init: initialize,
+            info: $info_func,
+            commands: [
+                ["json.del", json_command!(json_del), "write", 1,1,1],
+                ["json.get", json_command!(json_get), "readonly", 1,1,1],
+                ["json.mget", json_command!(json_mget), "readonly", 1,1,1],
+                ["json.set", json_command!(json_set), "write deny-oom", 1,1,1],
+                ["json.type", json_command!(json_type), "readonly", 1,1,1],
+                ["json.numincrby", json_command!(json_num_incrby), "write", 1,1,1],
+                ["json.toggle", json_command!(json_bool_toggle), "write deny-oom", 1,1,1],
+                ["json.nummultby", json_command!(json_num_multby), "write", 1,1,1],
+                ["json.numpowby", json_command!(json_num_powby), "write", 1,1,1],
+                ["json.strappend", json_command!(json_str_append), "write deny-oom", 1,1,1],
+                ["json.strlen", json_command!(json_str_len), "readonly", 1,1,1],
+                ["json.arrappend", json_command!(json_arr_append), "write deny-oom", 1,1,1],
+                ["json.arrindex", json_command!(json_arr_index), "readonly", 1,1,1],
+                ["json.arrinsert", json_command!(json_arr_insert), "write deny-oom", 1,1,1],
+                ["json.arrlen", json_command!(json_arr_len), "readonly", 1,1,1],
+                ["json.arrpop", json_command!(json_arr_pop), "write", 1,1,1],
+                ["json.arrtrim", json_command!(json_arr_trim), "write", 1,1,1],
+                ["json.objkeys", json_command!(json_obj_keys), "readonly", 1,1,1],
+                ["json.objlen", json_command!(json_obj_len), "readonly", 1,1,1],
+                ["json.clear", json_command!(json_clear), "write", 1,1,1],
+                ["json.debug", json_command!(json_debug), "readonly", 2,2,1],
+                ["json.forget", json_command!(json_del), "write", 1,1,1],
+                ["json.resp", json_command!(json_resp), "readonly", 1,1,1],
+            ],
         }
     }
 }
 
-fn json_len<F: Fn(&RedisJSON, &String) -> Result<usize, Error>>(
-    ctx: &Context,
-    args: Vec<String>,
-    fun: F,
-) -> RedisResult {
-    let mut args = args.into_iter().skip(1);
-    let key = args.next_string()?;
-    let path = backwards_compat_path(args.next_string()?);
+#[cfg(not(feature = "as-library"))]
+const fn pre_command(_ctx: &Context, _args: &[RedisString]) {}
 
-    let key = ctx.open_key(&key);
-    let length = match key.get_value::<RedisJSON>(&REDIS_JSON_TYPE)? {
-        Some(doc) => fun(&doc, &path)?.into(),
-        None => RedisValue::None,
-    };
-
-    Ok(length)
+#[cfg(not(feature = "as-library"))]
+const fn dummy_init(_ctx: &Context, _args: &[RedisString]) -> Status {
+    Status::Ok
 }
 
-fn json_cache_info(_ctx: &Context, _args: Vec<String>) -> RedisResult {
-    Err("Command was not implemented".into())
-}
+#[cfg(not(feature = "as-library"))]
+const fn dummy_info(_ctx: &InfoContext, _for_crash_report: bool) {}
 
-fn json_cache_init(_ctx: &Context, _args: Vec<String>) -> RedisResult {
-    Err("Command was not implemented".into())
-}
-//////////////////////////////////////////////////////
-
-pub extern "C" fn init(raw_ctx: *mut rawmod::RedisModuleCtx) -> c_int {
-    crate::commands::index::schema_map::init();
-    redisearch_api::init(raw_ctx)
-}
-
-redis_module! {
-    name: "ReJSON",
-    version: 999999,
-    data_types: [
-        REDIS_JSON_TYPE,
-    ],
-    init: init,
-    commands: [
-        ["json.del", json_del, "write"],
-        ["json.get", json_get, ""],
-        ["json.mget", json_mget, ""],
-        ["json.set", json_set, "write deny-oom"],
-        ["json.type", json_type, ""],
-        ["json.numincrby", json_num_incrby, "write"],
-        ["json.nummultby", json_num_multby, "write"],
-        ["json.numpowby", json_num_powby, "write"],
-        ["json.strappend", json_str_append, "write deny-oom"],
-        ["json.strlen", json_str_len, ""],
-        ["json.arrappend", json_arr_append, "write deny-oom"],
-        ["json.arrindex", json_arr_index, ""],
-        ["json.arrinsert", json_arr_insert, "write deny-oom"],
-        ["json.arrlen", json_arr_len, ""],
-        ["json.arrpop", json_arr_pop, "write"],
-        ["json.arrtrim", json_arr_trim, "write"],
-        ["json.objkeys", json_obj_keys, ""],
-        ["json.objlen", json_obj_len, ""],
-        ["json.debug", json_debug, ""],
-        ["json.forget", json_del, "write"],
-        ["json.resp", json_resp, ""],
-        ["json.index", commands::index::index, "write deny-oom"],
-        ["json.qget", commands::index::qget, ""],
-        ["json._cacheinfo", json_cache_info, ""],
-        ["json._cacheinit", json_cache_init, "write"],
-    ],
+#[cfg(not(feature = "as-library"))]
+redis_json_module_create! {
+    data_types: [REDIS_JSON_TYPE],
+    pre_command_function: pre_command,
+    get_manage: {
+        match get_manager_type() {
+            ManagerType::IValue => Some(ivalue_manager::RedisIValueJsonKeyManager{phantom:PhantomData}),
+            _ => None,
+        }
+    },
+    version: 02_04_02,
+    init: dummy_init,
+    info: dummy_info,
 }

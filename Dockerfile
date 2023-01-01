@@ -1,28 +1,36 @@
-FROM rust:latest as builder
+#----------------------------------------------------------------------------------------------
+FROM redis:7-bullseye AS redis
+FROM debian:bullseye-slim AS builder
 
-ENV LIBDIR /usr/lib/redis/modules
-ENV DEPS "python python-setuptools python3-pip wget unzip build-essential clang cmake"
+RUN if [ -f /root/.profile ]; then sed -ie 's/mesg n/tty -s \&\& mesg -n/g' /root/.profile; fi
+SHELL ["/bin/bash", "-l", "-c"]
 
-# Set up a build environment
-RUN set -ex;\
-    deps="$DEPS";\
-    apt-get update; \
-    apt-get install -y --no-install-recommends $deps;\
-    pip install rmtest
+RUN echo "Building for bullseye (debian:bullseye-slim) for x64 [with Redis 7]"
 
-# Build the source
-ADD . /REJSON
-WORKDIR /REJSON
-RUN set -ex;\
-    cargo build --release;\
-    mv target/release/librejson.so target/release/rejson.so
+WORKDIR /build
+COPY --from=redis /usr/local/ /usr/local/
 
-# Package the runner
-FROM redis:latest
-ENV LIBDIR /usr/lib/redis/modules
+ADD . /build
+
+RUN ./deps/readies/bin/getupdates
+RUN ./deps/readies/bin/getpy3
+RUN ./sbin/system-setup.py
+
+RUN /usr/local/bin/redis-server --version
+
+RUN make build SHOW=1
+
+#----------------------------------------------------------------------------------------------
+FROM redisfab/redisearch:master-x64-bullseye AS search
+FROM redis:7-bullseye
+
 WORKDIR /data
-RUN set -ex;\
-    mkdir -p "$LIBDIR";
-COPY --from=builder /REJSON/target/release/rejson.so "$LIBDIR"
 
-CMD ["redis-server", "--loadmodule", "/usr/lib/redis/modules/rejson.so"]
+RUN mkdir -p "/usr/lib/redis/modules"
+
+COPY --from=builder /build/bin/linux-x64-release/rejson.so* "/usr/lib/redis/modules/"
+RUN true
+COPY --from=search  /usr/lib/redis/modules/redisearch.so* "/usr/lib/redis/modules/"
+RUN true
+
+RUN chown -R redis:redis /usr/lib/redis/modules

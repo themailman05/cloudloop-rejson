@@ -1,3 +1,9 @@
+/*
+ * Copyright Redis Ltd. 2016 - present
+ * Licensed under your choice of the Redis Source Available License 2.0 (RSALv2) or
+ * the Server Side Public License v1 (SSPLv1).
+ */
+
 pub(crate) trait ArrayIndex {
     fn normalize(self, len: i64) -> usize;
 }
@@ -6,8 +12,10 @@ impl ArrayIndex for i64 {
     fn normalize(self, len: i64) -> usize {
         let index = if self < 0 {
             len - len.min(-self)
-        } else {
+        } else if len > 0 {
             (len - 1).min(self)
+        } else {
+            0
         };
         index as usize
     }
@@ -29,5 +37,8 @@ mod tests {
         assert_eq!(4.normalize(5), 4);
         assert_eq!(5.normalize(5), 4);
         assert_eq!(6.normalize(5), 4);
+        assert_eq!(0.normalize(0), 0);
+        assert_eq!((-1).normalize(0), 0);
+        assert_eq!(1.normalize(0), 0);
     }
 }
